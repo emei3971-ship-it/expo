@@ -26,7 +26,7 @@ import { stringToUUID } from './debugId';
 import { getExportPathForDependencyWithOptions } from './exportPath';
 import type { ExpoSerializerOptions } from './fork/baseJSBundle';
 import { getCssSerialAssets } from './getCssDeps';
-import type { SerialAsset } from './serializerAssets';
+import type { ChunkingStrategy, SerialAsset } from './serializerAssets';
 import { appendDebugIdToSourceMap, sourceMapString } from './sourceMap';
 import type { SerializerConfigOptions } from './withExpoSerializers';
 
@@ -78,6 +78,7 @@ type ChunkSettings = {
 export type SerializeChunkOptions = {
   includeSourceMaps: boolean;
   splitChunks: boolean;
+  chunkingStrategy: ChunkingStrategy;
 } & SerializerConfigOptions;
 
 export async function graphToSerialAssetsAsync(
@@ -95,6 +96,7 @@ export async function graphToSerialAssetsAsync(
     projectRoot: options.projectRoot,
   });
 
+  // TODO(@hassankhan): Use serializeChunkOptions.chunkingStrategy to branch logic here once the BitSet strategy is ready
   // Create chunks for splitting.
   const chunks = new Set<Chunk>();
   const entryChunks = gatherChunks(
