@@ -24,6 +24,12 @@
 - [iOS] The SwiftPM autolinking plugin now takes each module's iOS deployment floor from `expo-modules-autolinking prebuilt-metadata` and raises it to ExpoModulesCore's, matching `use_expo_modules!`. A module declaring a lower floor than the core it links against no longer builds below it.
 - [iOS] The SwiftPM autolinking plugin now loads the Expo Swift macro plugin when it compiles a module from source, the way `pod install` does. A module using `@Field`, `@Record` or `@OptimizedFunction` no longer fails to build with "external macro implementation could not be found".
 - [iOS] The SwiftPM autolinking plugin now links the SwiftPM packages a precompiled module bundles, such as expo-image's SDWebImage. It also warns about a precompiled module's pod dependencies that the SwiftPM graph does not provide.
+- [iOS] The SwiftPM autolinking plugin now declares the SwiftPM packages a pure-Swift module depends on in its generated manifest, so a module such as expo-image resolves its third-party imports instead of failing to compile.
+- [iOS] The SwiftPM autolinking plugin now mirrors the Swift packages a module's checked-in `Package.swift` declares, at both package and target level, so a module such as expo-image resolves `SDWebImage` instead of failing to compile with `no such module`.
+- [iOS] The SwiftPM autolinking plugin now honours a product's `autolinkWhen` condition, so a gated product of a module shipping a checked-in `Package.swift` is linked only when the app's configuration enables it, as `pod install` already does.
+- [iOS] The SwiftPM autolinking plugin now fails the sync when a pod gated by an `autolinkWhen` condition would be linked without that condition being checked — as a precompiled framework, or built from source without a checked-in `Package.swift` — instead of linking it regardless of the app's configuration.
+- [iOS] The SwiftPM autolinking plugin now fails the sync when `Podfile.properties.json` cannot be read as a JSON object, instead of continuing with no properties. Every gated product then fell to its own default instead of the app's configuration, which silently disagreed with what CocoaPods would install.
+- [iOS] Fail the SwiftPM autolinking sync with a specific error for a module that has prebuilt XCFrameworks for only some of its pods, instead of building it from source and linking the prebuilt pods twice.
 
 ### 💡 Others
 

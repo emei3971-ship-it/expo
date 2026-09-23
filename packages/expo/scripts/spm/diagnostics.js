@@ -78,6 +78,16 @@ function classifyUnsupported({ pending, coreAvailable }) {
   }
   return pending.map((p) => {
     const subject = { podName: p.podName, packageName: p.packageName, moduleRoot: p.moduleRoot };
+    if (p.precompiledSiblings?.length) {
+      return {
+        reason: 'partially-precompiled',
+        ...subject,
+        precompiledSiblings: p.precompiledSiblings,
+        precompiledProducts: p.precompiledProducts,
+        artifactDirs: p.artifactDirs,
+        prebuildProduct: p.prebuildProduct ?? null,
+      };
+    }
     const prebuildable = p.prebuildProduct != null && !p.prebuildProduct.sourceOnly;
     if (prebuildable) {
       return { reason: 'prebuild-available', ...subject, productName: p.prebuildProduct.name };
@@ -91,6 +101,13 @@ function classifyUnsupported({ pending, coreAvailable }) {
         reason: 'unsupported-target-dependency',
         ...subject,
         dependencies: p.unsupportedTargetDeps,
+      };
+    }
+    if (p.unsupportedPackageDeps?.length) {
+      return {
+        reason: 'unsupported-package-dependency',
+        ...subject,
+        dependencies: p.unsupportedPackageDeps,
       };
     }
     if (p.unresolvedTargets?.length) {
@@ -270,6 +287,151 @@ function renderUnsupportedTargetDependency({ podName, packageName, moduleRoot, d
   ].join('\n');
 }
 
+/** What a fault is about, when it is a package the manifest declares. */
+function packageSubject(identity, target) {
+  const named = identity != null ? `package "${identity}"` : 'an unnamed package';
+  return target != null ? `${named}, used by target "${target}",` : named;
+}
+
+/** What a fault is about, when it is one target's dependency rather than a package. */
+const dependencySubject = (identity, target) =>
+  `the dependency on "${identity}" in target "${target}"`;
+
+const conditionStep = (packageName) =>
+  `Condition it on platforms alone in ${packageName}'s Package.swift. Rendering it without the rest would apply the dependency more widely than the module declared.`;
+
+// Map, not an object, for the same reason TARGET_KIND_PHRASES is one. One fault, one
+// cause and one next step: the causes have nothing in common but the module they skip.
+const PACKAGE_DEPENDENCY_FAULTS = new Map([
+  [
+    'local-path',
+    {
+      fault: 'is declared at a local path, which this plugin does not resolve',
+      step: (packageName) =>
+        `Declare it by remote URL in ${packageName}'s Package.swift — the generated package is written into the app's build directory, and a path declared relative to the module does not reach from there.`,
+    },
+  ],
+  [
+    'registry',
+    {
+      fault: 'is declared through a package registry, which this plugin does not declare',
+      step: (packageName) => `Declare it by remote URL in ${packageName}'s Package.swift instead.`,
+    },
+  ],
+  [
+    'unsupported-location',
+    {
+      fault: 'is declared from a source-control location that is not a remote URL',
+      step: (packageName) => `Declare it by remote URL in ${packageName}'s Package.swift instead.`,
+    },
+  ],
+  [
+    'unsupported-requirement',
+    {
+      fault: 'names a version requirement this plugin cannot render',
+      step: () =>
+        'Pin it to an exact version, a branch, a revision or a version range, which are the requirements the generated package can declare.',
+    },
+  ],
+  [
+    'unknown-form',
+    {
+      fault: 'is declared in a form this plugin does not recognize',
+      step: (packageName) =>
+        `Declare it by remote URL in ${packageName}'s Package.swift. A newer Swift Package Manager form needs support added in expo/scripts/spm/manifests.js.`,
+    },
+  ],
+  [
+    'undeclared-package',
+    {
+      fault: 'is not declared by the manifest, so the product that names it resolves to nothing',
+      step: (packageName) =>
+        `Declare that package in ${packageName}'s Package.swift, or correct the package name on the dependency — Swift Package Manager matches it against the package's identity, which is the repository name.`,
+    },
+  ],
+  [
+    'collides-with-injected',
+    {
+      fault:
+        'has the same identity as a package React Native already contributes, and Swift Package Manager resolves one identity to one package',
+      step: () =>
+        "Depend on the product React Native's package already provides and remove the declaration, or declare a package whose repository name differs from React Native's.",
+    },
+  ],
+  [
+    'module-aliases',
+    {
+      fault: 'is renamed with moduleAliases, which this plugin does not render',
+      step: (packageName) =>
+        `Drop the alias in ${packageName}'s Package.swift and import the module under its own name. An alias that resolves a duplicate module name has no equivalent here.`,
+    },
+  ],
+  [
+    'unsupported-condition',
+    {
+      fault: 'is conditioned on more than platforms, and this plugin renders only platforms',
+      step: conditionStep,
+    },
+  ],
+  [
+    'unsupported-target-condition',
+    {
+      subject: dependencySubject,
+      fault: 'is conditioned on more than platforms, and this plugin renders only platforms',
+      step: conditionStep,
+    },
+  ],
+  [
+    'ambiguous-package-name',
+    {
+      subject: (identity) => `"${identity}"`,
+      fault:
+        'is claimed by two of the packages the manifest declares, so a dependency naming it has no single answer',
+      step: (packageName) =>
+        `Give them distinct names in ${packageName}'s Package.swift. A package answers to its identity — the repository name — and to the name a deprecated \`.package(name:url:)\` gives it.`,
+    },
+  ],
+  [
+    'unsupported-traits',
+    {
+      fault:
+        'is declared with a trait set other than the default, which this plugin does not render',
+      step: (packageName) =>
+        `Declare it with its default traits in ${packageName}'s Package.swift. Traits select which of a package's code builds, so the generated package would build something else.`,
+    },
+  ],
+]);
+
+const UNKNOWN_PACKAGE_FAULT = {
+  fault: 'cannot be declared by the generated package',
+  step: (packageName) => `Declare it as a remote package in ${packageName}'s Package.swift.`,
+};
+
+function renderPackageDependencyLines({ form, identity, target }, packageName) {
+  const {
+    subject = packageSubject,
+    fault,
+    step,
+  } = PACKAGE_DEPENDENCY_FAULTS.get(form) ?? UNKNOWN_PACKAGE_FAULT;
+  return [`      ${subject(identity, target)} ${fault}.`, `        ${step(packageName)}`];
+}
+
+/**
+ * The module's manifest declares a Swift package the generated package cannot mirror.
+ * Emitting the module without it would compile until its first import of that package,
+ * with nothing naming the manifest that declared it.
+ */
+function renderUnsupportedPackageDependency({ podName, packageName, moduleRoot, dependencies }) {
+  return [
+    `error: Expo module "${packageName}" (pod ${podName}) ships a Package.swift the generated package cannot mirror, so it was skipped.`,
+    ...dependencies.flatMap((dependency) => renderPackageDependencyLines(dependency, packageName)),
+    `  The generated package re-declares what the module's own manifest declares, so its sources compile against the same packages under Swift Package Manager as under CocoaPods.`,
+    `  Adding an spm.config.json to ${packageName} is the other route: the Expo prebuild pipeline then builds the whole module into an XCFramework, resolving the module's packages as they are checked in. packages/expo-sensors is a worked example.`,
+    `  If you do not own ${packageName}, persist that file with \`npx patch-package ${packageName}\` and commit the patch — node_modules is not committed, so without it this error returns on every fresh install and in CI.`,
+    `  Module path: ${moduleRoot}`,
+  ].join('\n');
+}
+
 function renderNeedsManifestForLinkage({ podName, packageName, moduleRoot, file, line, snippet }) {
   return [
     `error: Expo module "${packageName}" (pod ${podName}) declares native linkage in its podspec, which the Swift Package Manager plugin does not read, so it was skipped.`,
@@ -278,6 +440,79 @@ function renderNeedsManifestForLinkage({ podName, packageName, moduleRoot, file,
     `  A podspec is Ruby: reading it without running it means guessing, and a guessed link line does not fail here — it fails in a shipped app with a missing symbol. Swift Package Manager needs the linkage stated exactly.`,
     `  Add a Package.swift to ${packageName} declaring the module's target with \`linkerSettings: [.linkedFramework("Photos"), .linkedLibrary("sqlite3")]\` — the plugin mirrors those verbatim. Or add an spm.config.json, so the Expo prebuild pipeline builds the module into an XCFramework instead. packages/expo-constants shows the shape of a checked-in Package.swift, though it declares no linkage of its own; packages/expo-sensors is a worked spm.config.json.`,
     `  If you do not own ${packageName}, persist that file with \`npx patch-package ${packageName}\` and commit the patch — node_modules is not committed, so without it this error returns on every fresh install and in CI.`,
+    `  Module path: ${moduleRoot}`,
+  ].join('\n');
+}
+
+/**
+ * Some of the module's pods resolved to prebuilt frameworks and the rest did not.
+ * Both source routes build the module whole, so emitting it would link the
+ * prebuilt pods twice — once as frameworks, once from source.
+ */
+function renderPartiallyPrecompiled({
+  podName,
+  packageName,
+  moduleRoot,
+  precompiledSiblings,
+  precompiledProducts,
+  artifactDirs,
+  prebuildProduct,
+}) {
+  const siblings = precompiledSiblings.join(', ');
+  const one = precompiledSiblings.length === 1;
+  const artifacts = precompiledProducts
+    .map((product) => `${product}.xcframework or ${product}.tar.gz`)
+    .join(', ');
+  const sourceOnly = prebuildProduct?.sourceOnly === true;
+  const productStep =
+    prebuildProduct == null
+      ? `add a product for ${podName} to ${packageName}'s spm.config.json, then build it`
+      : `build ${podName} too — ${packageName}'s spm.config.json already declares "${prebuildProduct.name}"`;
+  const precompile = [
+    `To precompile all of them, ${productStep}. Omit --flavor so both Debug and Release are built, since the plugin declares an immutable pair and rejects a half-built one:`,
+    `      et prebuild ${packageName}`,
+    `     Then re-run \`npx react-native spm update\`.`,
+  ];
+  const remedies = [
+    ...(sourceOnly ? [] : [precompile]),
+    [
+      `To build it from source instead, delete the prebuilt ${siblings} artifacts — ${artifacts}, under debug/xcframeworks and release/xcframeworks — from each directory below, then re-run \`npx react-native spm update\`. The plugin searches them in this order and uses the first one that has an artifact, so one left behind anywhere is picked up again:`,
+      ...artifactDirs.map((dir) => `      ${dir}`),
+    ],
+    [
+      `To build without this module for now, exclude it in your app's package.json: "expo": { "autolinking": { "exclude": ["${packageName}"] } } — its native module will then be unavailable at runtime.`,
+    ],
+  ];
+  return [
+    `error: Expo module "${packageName}" (pod ${podName}) has no prebuilt XCFramework, but its sibling ${one ? 'pod' : 'pods'} ${siblings} ${one ? 'does' : 'do'}, so the module cannot be built with Swift Package Manager.`,
+    `  The plugin links ${siblings} as ${one ? 'a precompiled framework' : 'precompiled frameworks'}. It can build ${packageName} from source only as a whole module, every pod at once, so building ${podName} from source would link ${siblings} twice: once as ${one ? 'a framework' : 'frameworks'} and once from source.`,
+    sourceOnly
+      ? `  ${packageName}'s spm.config.json marks ${podName} as sourceOnly, so it never gets an XCFramework and the module cannot be precompiled as a whole:`
+      : `  A module must be precompiled for all of its pods or for none of them:`,
+    ...remedies.flatMap(([first, ...rest], i) => [`  ${i + 1}. ${first}`, ...rest]),
+    `  Module path: ${moduleRoot}`,
+  ].join('\n');
+}
+
+/**
+ * Refused whether or not the condition is met: a link that never consults the
+ * condition is only right by coincidence, and the coincidence changes with the
+ * app's configuration.
+ */
+function renderUncheckedAutolinkCondition({
+  podName,
+  packageName,
+  moduleRoot,
+  productName,
+  precompiled,
+}) {
+  const linkedAs = precompiled
+    ? 'as a precompiled XCFramework'
+    : 'from source without a checked-in Package.swift';
+  return [
+    `error: Expo module "${packageName}" declares an autolinkWhen condition for its product "${productName}" (pod ${podName}), but the product would be linked ${linkedAs}.`,
+    `  The Swift Package Manager plugin checks autolinkWhen only for packages that ship a checked-in Package.swift. Linking "${productName}" any other way would ignore its condition, so the sync stops instead.`,
+    `  Ship a checked-in Package.swift for ${packageName}, so the condition decides whether "${productName}" is linked. Or remove the ${podName} podspec from \`apple.podspecPath\` in ${packageName}'s expo-module.config.json, so the product is never linked this way. If "${productName}" should always be linked, drop its autolinkWhen from spm.config.json instead.`,
     `  Module path: ${moduleRoot}`,
   ].join('\n');
 }
@@ -299,7 +534,10 @@ const RENDERERS = {
   'no-apple-sources': renderNoAppleSources,
   'unresolvable-target-path': renderUnresolvableTargetPath,
   'unsupported-target-dependency': renderUnsupportedTargetDependency,
+  'unsupported-package-dependency': renderUnsupportedPackageDependency,
   'needs-manifest-for-linkage': renderNeedsManifestForLinkage,
+  'partially-precompiled': renderPartiallyPrecompiled,
+  'unchecked-autolink-condition': renderUncheckedAutolinkCondition,
   'core-unavailable': renderCoreUnavailable,
 };
 

@@ -9,7 +9,10 @@ jest.mock('../cli', () => ({
   generateModulesProvider: jest.fn(() => null),
   runDumpPackage: jest.fn(),
 }));
+// The properties reader stays real, so a gated product is decided by a file on
+// disk rather than by a stand-in for it.
 jest.mock('../app-target', () => ({
+  ...jest.requireActual('../app-target'),
   resolveAppTarget: jest.fn(() => ({
     targetName: null,
     entitlementPath: null,
@@ -43,6 +46,7 @@ const { resolveAppTarget } = require('../app-target');
 const { findModuleRoot } = require('../classify');
 const { UnsupportedModulesError } = require('../diagnostics');
 const {
+  artifactBaseDirs,
   prepareCompileInterfaces,
   resolveFlavoredFramework,
   resolveSpmDependencyFrameworks,
@@ -1043,6 +1047,244 @@ describe('the checked-in manifest branch', () => {
   });
 });
 
+describe.each([
+  ['a checked-in manifest', 'ExpoDual'],
+  ['a checked-in manifest', 'ExpoDualExtras'],
+  ['pure-Swift sources', 'ExpoDual'],
+  ['pure-Swift sources', 'ExpoDualExtras'],
+])('a two-pod module with %s whose only precompiled pod is %s', (kind, precompiledPod) => {
+  const sourcePod = precompiledPod === 'ExpoDual' ? 'ExpoDualExtras' : 'ExpoDual';
+  const logs = captureConsole();
+  let outDir;
+  let thrown;
+
+  beforeAll(() => {
+    const tmp = makeTempDir('expo-spm-plugin-partial-');
+    outDir = path.join(tmp, 'out');
+    const core = pureSwiftModule(path.join(tmp, 'expo-modules-core'), 'ExpoModulesCore', spec());
+    const dual = path.join(tmp, 'expo-dual');
+    const dualPodspecDir = pureSwiftModule(dual, 'ExpoDual', spec());
+    fs.writeFileSync(path.join(dualPodspecDir, 'ExpoDualExtras.podspec'), spec());
+    if (kind === 'a checked-in manifest') {
+      fs.writeFileSync(path.join(dual, 'Package.swift'), '// swift-tools-version: 6.0\n');
+      runDumpPackage.mockReturnValue(
+        JSON.stringify({
+          name: 'ExpoDual',
+          products: [{ name: 'ExpoDual', type: { library: ['automatic'] }, targets: ['ExpoDual'] }],
+          targets: [{ name: 'ExpoDual', type: 'regular', path: 'ios', dependencies: [] }],
+        })
+      );
+    }
+    resolveFlavoredFramework.mockImplementation(({ frameworkName }) =>
+      ['ExpoModulesCore', precompiledPod].includes(frameworkName)
+        ? { id: frameworkName, frameworkName }
+        : null
+    );
+    resolveExpoModules.mockReturnValue({
+      modules: [
+        {
+          packageName: 'expo-modules-core',
+          pods: [{ podName: 'ExpoModulesCore', podspecDir: core }],
+        },
+        {
+          packageName: 'expo-dual',
+          pods: [
+            { podName: 'ExpoDual', podspecDir: dualPodspecDir },
+            { podName: 'ExpoDualExtras', podspecDir: dualPodspecDir },
+          ],
+        },
+      ],
+      extraDependencies: [],
+    });
+    thrown = thrownBy(() => runPlugin(tmp));
+  });
+
+  afterAll(restoreModuleMocks);
+
+  it('fails the sync for the pod that is not precompiled, naming the one that is', () => {
+    expect(thrown).toBeInstanceOf(UnsupportedModulesError);
+    expect(thrown.unsupported).toEqual([
+      expect.objectContaining({
+        reason: 'partially-precompiled',
+        podName: sourcePod,
+        packageName: 'expo-dual',
+        precompiledSiblings: [precompiledPod],
+      }),
+    ]);
+    expect(printed(logs.error)).toContain(`error: Expo module "expo-dual" (pod ${sourcePod})`);
+  });
+
+  it('emits no source package for the module, so the precompiled pod is linked once', () => {
+    expect(fs.existsSync(path.join(outDir, 'expo', 'expo-source', 'ExpoDual'))).toBe(false);
+  });
+});
+
+describe('a partially precompiled module', () => {
+  const logs = captureConsole({ each: true });
+
+  afterEach(restoreModuleMocks);
+
+  function syncPartialModule({ sources, pods, precompiled }) {
+    const tmp = makeTempDir('expo-spm-plugin-partial-');
+    const outDir = path.join(tmp, 'out');
+    const core = pureSwiftModule(path.join(tmp, 'expo-modules-core'), 'ExpoModulesCore', spec());
+    const moduleRoot = path.join(tmp, 'expo-dual');
+    const podspecDir = pureSwiftModule(moduleRoot, pods[0], spec());
+    for (const podName of pods.slice(1)) {
+      fs.writeFileSync(path.join(podspecDir, `${podName}.podspec`), spec());
+    }
+    if (sources !== 'swift') {
+      fs.writeFileSync(path.join(podspecDir, 'B.m'), '// objc\n');
+    }
+    if (sources === 'mixed with a manifest') {
+      fs.writeFileSync(path.join(moduleRoot, 'Package.swift'), '// swift-tools-version: 6.0\n');
+      runDumpPackage.mockReturnValue(
+        JSON.stringify({
+          name: 'ExpoDual',
+          products: [{ name: 'ExpoDual', type: { library: ['automatic'] }, targets: ['ExpoDual'] }],
+          targets: [{ name: 'ExpoDual', type: 'regular', path: 'ios', dependencies: [] }],
+        })
+      );
+    }
+    resolveFlavoredFramework.mockImplementation(({ frameworkName }) =>
+      ['ExpoModulesCore', ...precompiled].includes(frameworkName)
+        ? { id: frameworkName, frameworkName }
+        : null
+    );
+    resolveExpoModules.mockReturnValue({
+      modules: [
+        {
+          packageName: 'expo-modules-core',
+          pods: [{ podName: 'ExpoModulesCore', podspecDir: core }],
+        },
+        { packageName: 'expo-dual', pods: pods.map((podName) => ({ podName, podspecDir })) },
+      ],
+      extraDependencies: [],
+    });
+    const thrown = thrownBy(() => runPlugin(tmp));
+    const sourceDir = path.join(outDir, 'expo', 'expo-source');
+    return {
+      thrown,
+      report: printed(logs.error),
+      moduleRoot,
+      sourcePackages: fs.existsSync(sourceDir) ? fs.readdirSync(sourceDir) : [],
+    };
+  }
+
+  it('is refused when a checked-in manifest covers mixed-language sources', () => {
+    const { thrown, sourcePackages } = syncPartialModule({
+      sources: 'mixed with a manifest',
+      pods: ['ExpoDual', 'ExpoDualExtras'],
+      precompiled: ['ExpoDual'],
+    });
+    expect(thrown.unsupported).toEqual([
+      expect.objectContaining({ reason: 'partially-precompiled', podName: 'ExpoDualExtras' }),
+    ]);
+    expect(sourcePackages).toEqual([]);
+  });
+
+  it('keeps the mixed-language report when it has no manifest, since it is never built from source', () => {
+    const { thrown, sourcePackages } = syncPartialModule({
+      sources: 'mixed',
+      pods: ['ExpoDual', 'ExpoDualExtras'],
+      precompiled: ['ExpoDual'],
+    });
+    expect(thrown.unsupported).toEqual([
+      expect.objectContaining({ reason: 'mixed-no-manifest', podName: 'ExpoDualExtras' }),
+    ]);
+    expect(sourcePackages).toEqual([]);
+  });
+
+  it('reports every pod that is not precompiled', () => {
+    const { thrown } = syncPartialModule({
+      sources: 'swift',
+      pods: ['ExpoDual', 'ExpoDualExtras', 'ExpoDualKit', 'ExpoDualUI'],
+      precompiled: ['ExpoDual', 'ExpoDualKit'],
+    });
+    expect(thrown.unsupported).toEqual([
+      expect.objectContaining({
+        reason: 'partially-precompiled',
+        podName: 'ExpoDualExtras',
+        precompiledSiblings: ['ExpoDual', 'ExpoDualKit'],
+      }),
+      expect.objectContaining({
+        reason: 'partially-precompiled',
+        podName: 'ExpoDualUI',
+        precompiledSiblings: ['ExpoDual', 'ExpoDualKit'],
+      }),
+    ]);
+  });
+
+  it('names every directory the artifact resolver searches, in its order', () => {
+    const previous = process.env.EXPO_PRECOMPILED_MODULES_PATH;
+    process.env.EXPO_PRECOMPILED_MODULES_PATH = '/precompiled';
+    try {
+      const { report, moduleRoot } = syncPartialModule({
+        sources: 'swift',
+        pods: ['ExpoDual', 'ExpoDualExtras'],
+        precompiled: ['ExpoDual'],
+      });
+      const searched = artifactBaseDirs('expo-dual', moduleRoot);
+      expect(searched).toHaveLength(3);
+      const positions = searched.map((dir) => report.indexOf(dir));
+      expect(positions.every((position) => position >= 0)).toBe(true);
+      expect(positions).toEqual([...positions].sort((a, b) => a - b));
+    } finally {
+      if (previous === undefined) {
+        delete process.env.EXPO_PRECOMPILED_MODULES_PATH;
+      } else {
+        process.env.EXPO_PRECOMPILED_MODULES_PATH = previous;
+      }
+    }
+  });
+});
+
+describe('a partially precompiled module whose precompiled product is not named after its pod', () => {
+  const logs = captureConsole();
+  let thrown;
+
+  beforeAll(() => {
+    const tmp = makeTempDir('expo-spm-plugin-partial-product-');
+    const core = pureSwiftModule(path.join(tmp, 'expo-modules-core'), 'ExpoModulesCore', spec());
+    const skia = path.join(tmp, 'react-native-skia');
+    const podspecDir = pureSwiftModule(skia, 'RNSkiaPod', spec());
+    fs.writeFileSync(path.join(podspecDir, 'RNSkiaExtras.podspec'), spec());
+    prebuiltMetadata.mockReturnValue({ RNSkiaPod: metadataEntry(skia, 'RNSkia') });
+    resolveFlavoredFramework.mockImplementation(({ frameworkName }) =>
+      ['ExpoModulesCore', 'RNSkia'].includes(frameworkName)
+        ? { id: frameworkName, frameworkName }
+        : null
+    );
+    resolveExpoModules.mockReturnValue({
+      modules: [
+        {
+          packageName: 'expo-modules-core',
+          pods: [{ podName: 'ExpoModulesCore', podspecDir: core }],
+        },
+        {
+          packageName: 'react-native-skia',
+          pods: [
+            { podName: 'RNSkiaPod', podspecDir },
+            { podName: 'RNSkiaExtras', podspecDir },
+          ],
+        },
+      ],
+      extraDependencies: [],
+    });
+    thrown = thrownBy(() => runPlugin(tmp));
+  });
+
+  afterAll(restoreModuleMocks);
+
+  it('names the artifacts pass 1 looked up, under the product name', () => {
+    expect(thrown).toBeInstanceOf(UnsupportedModulesError);
+    const report = printed(logs.error);
+    expect(report).toContain('— RNSkia.xcframework or RNSkia.tar.gz, under');
+    expect(report).not.toContain('RNSkiaPod.xcframework');
+    expect(report).toContain('its sibling pod RNSkiaPod does');
+  });
+});
+
 // React Native hands the plugin its own autolinking data (`context.autolinking`,
 // the raw autolinking.json). Its `root` is where Node resolves the package from
 // the app — a resolved answer to the question the filesystem walk guesses at.
@@ -1255,6 +1497,7 @@ describe('a module installed twice', () => {
 describe('a module whose pods document two different copies', () => {
   const logs = captureConsole();
   let roots;
+  let thrown;
 
   beforeAll(() => {
     const tmp = fs.realpathSync(makeTempDir('expo-spm-pod-copies-'));
@@ -1300,7 +1543,9 @@ describe('a module whose pods document two different copies', () => {
       },
     });
     providerWrittenTo(path.join(tmp, 'out'));
-    runPlugin(tmp, { autolinking: { dependencies: { 'expo-multi': { root: roots.multi } } } });
+    thrown = thrownBy(() =>
+      runPlugin(tmp, { autolinking: { dependencies: { 'expo-multi': { root: roots.multi } } } })
+    );
   });
 
   afterAll(restoreModuleMocks);
@@ -1310,6 +1555,12 @@ describe('a module whose pods document two different copies', () => {
     expect(printed(logs.warn)).toContain('Expo module "expo-multi" is installed twice');
     expect(printed(logs.warn).match(/is installed twice/g)).toHaveLength(1);
     expect(printed(logs.warn)).toContain(roots.multiCopy);
+  });
+
+  // The pure-Swift branch emits the first pod only, so the second is uncovered.
+  it('fails the sync on the second pod, which nothing emits', () => {
+    expect(thrown).toBeInstanceOf(UnsupportedModulesError);
+    expect(thrown.unsupported.map((u) => u.podName)).toEqual(['ExpoMultiB']);
   });
 });
 
@@ -1364,5 +1615,827 @@ describe('the extra CocoaPods dependencies an app declares', () => {
     run([]);
 
     expect(printed(logs.warn)).not.toContain('Podfile.properties.json');
+  });
+});
+
+// A source-emitted module has no XCFramework to link its SwiftPM dependencies
+// into, so the generated manifest has to declare them itself.
+describe('the SwiftPM packages a source-emitted module declares', () => {
+  const logs = captureConsole();
+  let manifest;
+
+  beforeAll(() => {
+    const tmp = makeTempDir('expo-spm-source-deps-plugin-');
+    const outDir = path.join(tmp, 'out');
+    const core = pureSwiftModule(path.join(tmp, 'expo-modules-core'), 'ExpoModulesCore', spec());
+    const imageRoot = path.join(tmp, 'expo-image');
+    const image = pureSwiftModule(
+      imageRoot,
+      'ExpoImage',
+      spec(
+        "  s.dependency 'ExpoModulesCore'",
+        "  s.dependency 'SDWebImage'",
+        "  s.dependency 'libavif/libdav1d'",
+        "  s.dependency 'SomeUnmappedPod'"
+      )
+    );
+
+    resolveExpoModules.mockReturnValue({
+      modules: [
+        {
+          packageName: 'expo-modules-core',
+          pods: [{ podName: 'ExpoModulesCore', podspecDir: core }],
+        },
+        { packageName: 'expo-image', pods: [{ podName: 'ExpoImage', podspecDir: image }] },
+      ],
+      extraDependencies: [],
+    });
+    prebuiltMetadata.mockReturnValue({
+      ExpoImage: {
+        type: 'internal',
+        npmPackage: 'expo-image',
+        packageRoot: imageRoot,
+        podspecDir: image,
+        productName: 'ExpoImage',
+        sourceOnly: true,
+        spmPackages: [
+          {
+            url: 'https://github.com/SDWebImage/SDWebImage.git',
+            productName: 'SDWebImage',
+            version: { exact: '5.21.6' },
+          },
+          {
+            url: 'https://github.com/SDWebImage/libavif-Xcode.git',
+            productName: 'libavif',
+            version: { exact: '1.0.0' },
+          },
+        ],
+      },
+    });
+    providerWrittenTo(outDir);
+    runPlugin(tmp);
+    manifest = fs.readFileSync(
+      path.join(outDir, 'expo', 'expo-source', 'ExpoImage', 'Package.swift'),
+      'utf8'
+    );
+  });
+
+  afterAll(restoreModuleMocks);
+
+  it('declares them in the generated manifest', () => {
+    expect(manifest).toContain(
+      '.package(url: "https://github.com/SDWebImage/SDWebImage.git", exact: "5.21.6"),'
+    );
+    expect(manifest).toContain(
+      '.package(url: "https://github.com/SDWebImage/libavif-Xcode.git", exact: "1.0.0"),'
+    );
+    expect(manifest).toContain('.product(name: "SDWebImage", package: "SDWebImage"),');
+    expect(manifest).toContain('.product(name: "libavif", package: "libavif-Xcode"),');
+  });
+
+  it('counts them as counterparts of the pods its podspec depends on', () => {
+    const report = printed(logs.warn);
+    expect(report).toContain('warning: Expo module "expo-image" (pod ExpoImage)');
+    expect(report).toContain('SomeUnmappedPod');
+    expect(report).not.toContain('SDWebImage');
+    // The podspec asks for `libavif/libdav1d` and the check matches on the root
+    // name, as CocoaPods does. The two are not the same build: the SwiftPM
+    // `libavif` package ships only the libaom codec variant, where the pod's
+    // subspec selects dav1d. AVIF still decodes, only slower. Upstream exposes no
+    // dav1d product, so this is not ours to fix.
+    expect(report).not.toContain('libavif');
+  });
+});
+
+// A module that ships a checked-in Package.swift declares its SwiftPM packages there
+// rather than in an spm.config.json, and those cover the pods its podspec names just
+// as the pure-Swift branch's do.
+describe('the SwiftPM packages a checked-in manifest declares', () => {
+  const logs = captureConsole();
+  let manifest;
+
+  beforeAll(() => {
+    const tmp = makeTempDir('expo-spm-manifest-deps-plugin-');
+    const outDir = path.join(tmp, 'out');
+    const core = pureSwiftModule(path.join(tmp, 'expo-modules-core'), 'ExpoModulesCore', spec());
+    const imageRoot = path.join(tmp, 'expo-image');
+    const image = pureSwiftModule(
+      imageRoot,
+      'ExpoImage',
+      spec(
+        "  s.dependency 'ExpoModulesCore'",
+        "  s.dependency 'SDWebImage'",
+        "  s.dependency 'libavif/libdav1d'",
+        "  s.dependency 'SomeUnmappedPod'"
+      )
+    );
+    fs.writeFileSync(
+      path.join(imageRoot, 'Package.swift'),
+      '// swift-tools-version: 6.0\n// checked in by the module\n'
+    );
+    const remote = (identity, url, version) => ({
+      sourceControl: [
+        {
+          identity,
+          location: { remote: [{ urlString: url }] },
+          productFilter: null,
+          requirement: { exact: [version] },
+        },
+      ],
+    });
+    runDumpPackage.mockReturnValue(
+      JSON.stringify({
+        name: 'ExpoImage',
+        dependencies: [
+          remote('sdwebimage', 'https://github.com/SDWebImage/SDWebImage.git', '5.21.6'),
+          remote('libavif-xcode', 'https://github.com/SDWebImage/libavif-Xcode.git', '1.0.0'),
+        ],
+        products: [{ name: 'ExpoImage', type: { library: ['automatic'] }, targets: ['ExpoImage'] }],
+        targets: [
+          {
+            name: 'ExpoImage',
+            type: 'regular',
+            path: 'ios',
+            dependencies: [
+              { product: ['SDWebImage', 'SDWebImage', null, null] },
+              { product: ['libavif', 'libavif-Xcode', null, null] },
+            ],
+          },
+        ],
+      })
+    );
+
+    resolveExpoModules.mockReturnValue({
+      modules: [
+        {
+          packageName: 'expo-modules-core',
+          pods: [{ podName: 'ExpoModulesCore', podspecDir: core }],
+        },
+        { packageName: 'expo-image', pods: [{ podName: 'ExpoImage', podspecDir: image }] },
+      ],
+      extraDependencies: [],
+    });
+    providerWrittenTo(outDir);
+    runPlugin(tmp);
+    manifest = fs.readFileSync(
+      path.join(outDir, 'expo', 'expo-source', 'ExpoImage', 'Package.swift'),
+      'utf8'
+    );
+  });
+
+  afterAll(restoreModuleMocks);
+
+  it('mirrors them into the generated manifest', () => {
+    expect(manifest).toContain(
+      '.package(url: "https://github.com/SDWebImage/SDWebImage.git", exact: "5.21.6"),'
+    );
+    expect(manifest).toContain('.product(name: "libavif", package: "libavif-Xcode"),');
+  });
+
+  it('counts them as counterparts of the pods its podspec depends on', () => {
+    const report = printed(logs.warn);
+    expect(report).toContain('warning: Expo module "expo-image" (pod ExpoImage)');
+    expect(report).toContain('SomeUnmappedPod');
+    expect(report).not.toContain('SDWebImage');
+    // The podspec asks for `libavif/libdav1d` and the check matches on the root name,
+    // as CocoaPods does — the mirrored product is `libavif`, whatever its package is
+    // called.
+    expect(report).not.toContain('libavif');
+  });
+});
+
+describe('a pure-Swift package shipping a companion pod', () => {
+  const logs = captureConsole();
+  let thrown;
+
+  beforeAll(() => {
+    const tmp = makeTempDir('expo-spm-companion-');
+    const core = pureSwiftModule(path.join(tmp, 'expo-modules-core'), 'ExpoModulesCore', spec());
+    const camera = pureSwiftModule(
+      path.join(tmp, 'expo-camera'),
+      'ExpoCamera',
+      spec("  s.platforms = { :ios => '16.4' }")
+    );
+
+    resolveExpoModules.mockReturnValue({
+      modules: [
+        {
+          packageName: 'expo-modules-core',
+          pods: [{ podName: 'ExpoModulesCore', podspecDir: core }],
+        },
+        {
+          packageName: 'expo-camera',
+          pods: [
+            { podName: 'ExpoCamera', podspecDir: camera },
+            { podName: 'ExpoCameraBarcodeScanning', podspecDir: camera },
+          ],
+        },
+      ],
+      extraDependencies: [],
+    });
+    thrown = thrownBy(() => runPlugin(tmp));
+  });
+
+  afterAll(restoreModuleMocks);
+
+  it('emits the single target the pure-Swift branch builds', () => {
+    const report = printed(logs.log);
+    expect(report).toContain('source pure-Swift (1): ExpoCamera\n');
+  });
+
+  // The branch emits one target, for the first pod. Marking the rest of the package
+  // emitted too would drop the companion out of the install with no diagnostic at
+  // all — it fails at runtime with "Cannot find native module" instead.
+  it('reports the companion pod it does not build', () => {
+    const report = printed(logs.error);
+    expect(report).toContain('ExpoCameraBarcodeScanning');
+    expect(thrown).toBeInstanceOf(UnsupportedModulesError);
+    expect(thrown.unsupported.map((u) => u.podName)).toEqual(['ExpoCameraBarcodeScanning']);
+  });
+});
+
+// expo-camera is the shape: one checked-in manifest, two products, two pods. The
+// branch marks every pod of the package emitted, which is only right BECAUSE the
+// manifest covers them all — unlike the pure-Swift branch above, which emits one.
+describe('a checked-in manifest declaring a product per pod', () => {
+  const logs = captureConsole();
+  let manifest;
+  let thrown;
+
+  beforeAll(() => {
+    const tmp = makeTempDir('expo-spm-manifest-multipod-');
+    const outDir = path.join(tmp, 'out');
+    const core = pureSwiftModule(path.join(tmp, 'expo-modules-core'), 'ExpoModulesCore', spec());
+    const cameraRoot = path.join(tmp, 'expo-camera');
+    const camera = pureSwiftModule(cameraRoot, 'ExpoCamera', spec());
+    fs.mkdirSync(path.join(camera, 'barcode-scanning'), { recursive: true });
+    fs.writeFileSync(path.join(camera, 'barcode-scanning', 'Scanner.swift'), '// swift\n');
+    fs.writeFileSync(
+      path.join(cameraRoot, 'Package.swift'),
+      '// swift-tools-version: 6.0\n// checked in by the module\n'
+    );
+    runDumpPackage.mockReturnValue(
+      JSON.stringify({
+        name: 'ExpoCamera',
+        dependencies: [],
+        products: [
+          { name: 'ExpoCamera', type: { library: ['automatic'] }, targets: ['ExpoCamera'] },
+          {
+            name: 'ExpoCameraBarcodeScanning',
+            type: { library: ['automatic'] },
+            targets: ['ExpoCameraBarcodeScanning'],
+          },
+        ],
+        targets: [
+          { name: 'ExpoCamera', type: 'regular', path: 'ios', dependencies: [] },
+          {
+            name: 'ExpoCameraBarcodeScanning',
+            type: 'regular',
+            path: 'ios/barcode-scanning',
+            dependencies: [{ byName: ['ExpoCamera', null] }],
+          },
+        ],
+      })
+    );
+
+    resolveExpoModules.mockReturnValue({
+      modules: [
+        {
+          packageName: 'expo-modules-core',
+          pods: [{ podName: 'ExpoModulesCore', podspecDir: core }],
+        },
+        {
+          packageName: 'expo-camera',
+          pods: [
+            { podName: 'ExpoCamera', podspecDir: camera },
+            { podName: 'ExpoCameraBarcodeScanning', podspecDir: camera },
+          ],
+        },
+      ],
+      extraDependencies: [],
+    });
+    providerWrittenTo(outDir);
+    thrown = thrownBy(() => runPlugin(tmp));
+    manifest = fs.readFileSync(
+      path.join(outDir, 'expo', 'expo-source', 'ExpoCamera', 'Package.swift'),
+      'utf8'
+    );
+  });
+
+  afterAll(restoreModuleMocks);
+
+  it("mirrors a target for each of the package's pods", () => {
+    expect(manifest).toContain('name: "ExpoCamera"');
+    expect(manifest).toContain('name: "ExpoCameraBarcodeScanning"');
+  });
+
+  it('covers every pod of the package, so none is reported uncovered', () => {
+    const report = printed(logs.log);
+    expect(report).toContain('not supported (0): —');
+    expect(logs.error).not.toHaveBeenCalled();
+    expect(thrown).toBeNull();
+  });
+});
+
+// The gate a companion product declares in its spm.config.json. expo-camera's
+// barcode scanner is the one that ships: a second product of the same package,
+// linked only when the app's Podfile properties do not disable it.
+describe('a product gated by an autolinkWhen condition', () => {
+  const barcodeGate = {
+    podfileProperty: 'expo.camera.barcode-scanner-enabled',
+    disabledValue: 'false',
+  };
+  const logs = captureConsole({ each: true });
+  let tmp;
+  let cameraRoot;
+
+  beforeEach(() => {
+    tmp = makeTempDir('expo-spm-gated-');
+    const core = pureSwiftModule(path.join(tmp, 'expo-modules-core'), 'ExpoModulesCore', spec());
+    cameraRoot = path.join(tmp, 'expo-camera');
+    const camera = pureSwiftModule(cameraRoot, 'ExpoCamera', spec());
+    fs.mkdirSync(path.join(camera, 'barcode-scanning'), { recursive: true });
+    fs.writeFileSync(path.join(camera, 'barcode-scanning', 'Scanner.swift'), '// swift\n');
+    fs.writeFileSync(
+      path.join(cameraRoot, 'Package.swift'),
+      '// swift-tools-version: 6.0\n// checked in by the module\n'
+    );
+    runDumpPackage.mockReturnValue(
+      JSON.stringify({
+        name: 'ExpoCamera',
+        dependencies: [],
+        products: [
+          { name: 'ExpoCamera', type: { library: ['automatic'] }, targets: ['ExpoCamera'] },
+          {
+            name: 'ExpoCameraBarcodeScanning',
+            type: { library: ['automatic'] },
+            targets: ['ExpoCameraBarcodeScanning'],
+          },
+        ],
+        targets: [
+          { name: 'ExpoCamera', type: 'regular', path: 'ios', dependencies: [] },
+          {
+            name: 'ExpoCameraBarcodeScanning',
+            type: 'regular',
+            path: 'ios/barcode-scanning',
+            dependencies: [{ byName: ['ExpoCamera', null] }],
+          },
+        ],
+      })
+    );
+    resolveExpoModules.mockReturnValue({
+      modules: [
+        {
+          packageName: 'expo-modules-core',
+          pods: [{ podName: 'ExpoModulesCore', podspecDir: core }],
+        },
+        {
+          packageName: 'expo-camera',
+          pods: [
+            { podName: 'ExpoCamera', podspecDir: camera },
+            { podName: 'ExpoCameraBarcodeScanning', podspecDir: camera },
+          ],
+        },
+      ],
+      extraDependencies: [],
+    });
+  });
+
+  afterEach(() => {
+    runDumpPackage.mockReset();
+    restoreModuleMocks();
+  });
+
+  /** The properties are read off a real file, through the real reader. */
+  const run = ({ metadata, properties = null }) => {
+    const outDir = path.join(tmp, 'out');
+    const appIosDir = path.join(tmp, 'app', 'ios');
+    fs.mkdirSync(appIosDir, { recursive: true });
+    let podfilePropertiesPath = null;
+    if (properties != null) {
+      podfilePropertiesPath = path.join(appIosDir, 'Podfile.properties.json');
+      fs.writeFileSync(
+        podfilePropertiesPath,
+        typeof properties === 'string' ? properties : JSON.stringify(properties)
+      );
+    }
+    resolveAppTarget.mockReset();
+    resolveAppTarget.mockReturnValue({
+      targetName: null,
+      entitlementPath: null,
+      podfilePropertiesPath,
+    });
+    prebuiltMetadata.mockReturnValue(metadata);
+    providerWrittenTo(outDir);
+    const result = runPlugin(tmp);
+    return { result, report: printed(logs.log) };
+  };
+
+  const cameraMetadata = (gate) => ({
+    ExpoCamera: metadataEntry(cameraRoot, 'ExpoCamera'),
+    ExpoCameraBarcodeScanning: metadataEntry(cameraRoot, 'ExpoCameraBarcodeScanning', {
+      autolinkWhen: gate,
+    }),
+  });
+
+  it('wires the gated product when the condition is met', () => {
+    const { result, report } = run({
+      metadata: cameraMetadata(barcodeGate),
+      properties: { 'expo.camera.barcode-scanner-enabled': 'true' },
+    });
+
+    expect(result.productDependencies).toEqual([
+      { name: 'ExpoCamera', package: 'ExpoCamera' },
+      { name: 'ExpoCameraBarcodeScanning', package: 'ExpoCamera' },
+    ]);
+    expect(report).toContain('gated off (0): —');
+  });
+
+  it('withholds the gated product, and reports it, when the condition is not met', () => {
+    const { result, report } = run({
+      metadata: cameraMetadata(barcodeGate),
+      properties: { 'expo.camera.barcode-scanner-enabled': 'false' },
+    });
+
+    expect(result.productDependencies).toEqual([{ name: 'ExpoCamera', package: 'ExpoCamera' }]);
+    expect(report).toContain(
+      'gated off (1): ExpoCameraBarcodeScanning (expo.camera.barcode-scanner-enabled)'
+    );
+  });
+
+  // A withheld product is a deliberate exclusion, not a module SwiftPM cannot
+  // build: its pod stays emitted, so the sync does not fail it as unsupported.
+  it('does not report the withheld product as unsupported', () => {
+    const { report } = run({
+      metadata: cameraMetadata(barcodeGate),
+      properties: { 'expo.camera.barcode-scanner-enabled': 'false' },
+    });
+
+    expect(report).toContain('not supported (0): —');
+    expect(logs.error).not.toHaveBeenCalled();
+  });
+
+  // A properties file nobody can read leaves every gate unset, and an unset gate
+  // links the product. Guessing it open would link what this app may exclude.
+  it('fails instead of linking the gated product when the properties file is unusable', () => {
+    expect(() =>
+      run({ metadata: cameraMetadata(barcodeGate), properties: '{ "expo.camera' })
+    ).toThrow(/Podfile\.properties\.json could not be read as Podfile properties/);
+  });
+
+  // Fail OPEN: a product the document says nothing about carries no gate, and a
+  // path that fails to match must never silently drop one.
+  it('wires a product no metadata entry names', () => {
+    const { result, report } = run({
+      metadata: { ExpoCamera: metadataEntry(cameraRoot, 'ExpoCamera') },
+      properties: { 'expo.camera.barcode-scanner-enabled': 'false' },
+    });
+
+    expect(result.productDependencies).toEqual([
+      { name: 'ExpoCamera', package: 'ExpoCamera' },
+      { name: 'ExpoCameraBarcodeScanning', package: 'ExpoCamera' },
+    ]);
+    expect(report).toContain('gated off (0): —');
+  });
+
+  // Two packages may ship a product of the same name, so a bare product-name
+  // scan over the document would apply a stranger's gate to this one.
+  it('ignores a same-named product gated in another package', () => {
+    const { result, report } = run({
+      metadata: {
+        ExpoCamera: metadataEntry(cameraRoot, 'ExpoCamera'),
+        OtherBarcodeScanning: metadataEntry(
+          path.join(tmp, 'other-camera'),
+          'ExpoCameraBarcodeScanning',
+          { autolinkWhen: barcodeGate }
+        ),
+      },
+      properties: { 'expo.camera.barcode-scanner-enabled': 'false' },
+    });
+
+    expect(result.productDependencies).toEqual([
+      { name: 'ExpoCamera', package: 'ExpoCamera' },
+      { name: 'ExpoCameraBarcodeScanning', package: 'ExpoCamera' },
+    ]);
+    expect(report).toContain('gated off (0): —');
+  });
+
+  // `declaredPodNames` is every pod the install DECLARES. A pod the document
+  // names is a satisfied condition even when this pass never lists it.
+  it('wires a product gated on a pod the document declares', () => {
+    const { result, report } = run({
+      metadata: {
+        ExpoCamera: metadataEntry(cameraRoot, 'ExpoCamera'),
+        ExpoCameraBarcodeScanning: metadataEntry(cameraRoot, 'ExpoCameraBarcodeScanning', {
+          autolinkWhen: { podName: 'RNWorklets' },
+        }),
+        RNWorklets: metadataEntry(path.join(tmp, 'react-native-worklets'), 'RNWorklets'),
+      },
+    });
+
+    expect(result.productDependencies).toEqual([
+      { name: 'ExpoCamera', package: 'ExpoCamera' },
+      { name: 'ExpoCameraBarcodeScanning', package: 'ExpoCamera' },
+    ]);
+    expect(report).toContain('gated off (0): —');
+  });
+
+  it('withholds a product gated on a pod the document does not declare', () => {
+    const { result, report } = run({
+      metadata: cameraMetadata({ podName: 'RNWorklets' }),
+    });
+
+    expect(result.productDependencies).toEqual([{ name: 'ExpoCamera', package: 'ExpoCamera' }]);
+    expect(report).toContain('gated off (1): ExpoCameraBarcodeScanning (RNWorklets)');
+  });
+
+  it('wires a product gated on an npm package the app autolinks', () => {
+    const { result, report } = run({
+      metadata: cameraMetadata({ npmPackage: 'expo-modules-core' }),
+    });
+
+    expect(result.productDependencies).toEqual([
+      { name: 'ExpoCamera', package: 'ExpoCamera' },
+      { name: 'ExpoCameraBarcodeScanning', package: 'ExpoCamera' },
+    ]);
+    expect(report).toContain('gated off (0): —');
+  });
+
+  it('withholds a product gated on an npm package the app does not autolink', () => {
+    const { result, report } = run({
+      metadata: cameraMetadata({ npmPackage: 'react-native-worklets' }),
+    });
+
+    expect(result.productDependencies).toEqual([{ name: 'ExpoCamera', package: 'ExpoCamera' }]);
+    expect(report).toContain('gated off (1): ExpoCameraBarcodeScanning (react-native-worklets)');
+  });
+
+  // The document is keyed by POD name, and a pod name is not a product name.
+  it('matches the entry by its product name, not by its pod key', () => {
+    const { result, report } = run({
+      metadata: {
+        ExpoCamera: metadataEntry(cameraRoot, 'ExpoCamera'),
+        ExpoCameraBarcodeScanner: metadataEntry(cameraRoot, 'ExpoCameraBarcodeScanning', {
+          autolinkWhen: barcodeGate,
+        }),
+      },
+      properties: { 'expo.camera.barcode-scanner-enabled': 'false' },
+    });
+
+    expect(result.productDependencies).toEqual([{ name: 'ExpoCamera', package: 'ExpoCamera' }]);
+    expect(report).toContain(
+      'gated off (1): ExpoCameraBarcodeScanning (expo.camera.barcode-scanner-enabled)'
+    );
+  });
+
+  it('matches an entry naming no product by its pod key', () => {
+    const { result, report } = run({
+      metadata: {
+        ExpoCamera: metadataEntry(cameraRoot, 'ExpoCamera'),
+        ExpoCameraBarcodeScanning: { packageRoot: cameraRoot, autolinkWhen: barcodeGate },
+      },
+      properties: { 'expo.camera.barcode-scanner-enabled': 'false' },
+    });
+
+    expect(result.productDependencies).toEqual([{ name: 'ExpoCamera', package: 'ExpoCamera' }]);
+    expect(report).toContain(
+      'gated off (1): ExpoCameraBarcodeScanning (expo.camera.barcode-scanner-enabled)'
+    );
+  });
+
+  // Fail-open covers a MISSING match only. A condition the document declares and
+  // no key answers withholds the product, as CocoaPods withholds it — the
+  // metadata builder already warned about the shape when it published it.
+  it('withholds a product whose declared condition names no recognized key', () => {
+    const { result, report } = run({ metadata: cameraMetadata({}) });
+
+    expect(result.productDependencies).toEqual([{ name: 'ExpoCamera', package: 'ExpoCamera' }]);
+    expect(report).toContain('gated off (1): ExpoCameraBarcodeScanning (unrecognized condition)');
+  });
+
+  // Pins a path the real document cannot reach: `prebuiltMetadata` writes
+  // `packageRoot` only from a resolved package path. The lookup still may not
+  // throw — an emit pass aborted here would drop the module with no diagnostic.
+  it('keeps a product whose entry documents an unusable package root', () => {
+    const { result, report } = run({
+      metadata: {
+        ExpoCamera: metadataEntry(cameraRoot, 'ExpoCamera'),
+        ExpoCameraBarcodeScanning: { packageRoot: 17, autolinkWhen: barcodeGate },
+      },
+      properties: { 'expo.camera.barcode-scanner-enabled': 'false' },
+    });
+
+    expect(result.productDependencies).toEqual([
+      { name: 'ExpoCamera', package: 'ExpoCamera' },
+      { name: 'ExpoCameraBarcodeScanning', package: 'ExpoCamera' },
+    ]);
+    expect(report).toContain('gated off (0): —');
+  });
+
+  // The app target is a pure function of the app root, and generating the
+  // registry against a second reading of it would let the two disagree.
+  it('resolves the app target once', () => {
+    run({ metadata: cameraMetadata(barcodeGate) });
+
+    expect(resolveAppTarget).toHaveBeenCalledTimes(1);
+  });
+});
+
+// The condition is checked only where a module ships a checked-in Package.swift.
+// A gated pod reaching the plugin any other way would be linked with its
+// condition ignored, so the sync refuses it whichever way the condition falls.
+describe('a gated pod linked where its autolinkWhen condition is not checked', () => {
+  const barcodeGate = {
+    podfileProperty: 'expo.camera.barcode-scanner-enabled',
+    disabledValue: 'false',
+  };
+  let logs;
+  let tmp;
+  let modules;
+
+  beforeEach(() => {
+    tmp = makeTempDir('expo-spm-unchecked-gate-');
+    const podspecDirs = {
+      ExpoModulesCore: pureSwiftModule(
+        path.join(tmp, 'expo-modules-core'),
+        'ExpoModulesCore',
+        spec()
+      ),
+      ExpoCameraBarcodeScanning: pureSwiftModule(
+        path.join(tmp, 'expo-camera'),
+        'ExpoCameraBarcodeScanning',
+        spec()
+      ),
+      ExpoScanner: pureSwiftModule(path.join(tmp, 'expo-scanner'), 'ExpoScanner', spec()),
+      ExpoImage: pureSwiftModule(path.join(tmp, 'expo-image'), 'ExpoImage', spec()),
+    };
+    modules = Object.fromEntries(
+      [
+        ['expo-modules-core', 'ExpoModulesCore'],
+        ['expo-camera', 'ExpoCameraBarcodeScanning'],
+        ['expo-scanner', 'ExpoScanner'],
+        ['expo-image', 'ExpoImage'],
+      ].map(([packageName, podName]) => [
+        packageName,
+        { packageName, pods: [{ podName, podspecDir: podspecDirs[podName] }] },
+      ])
+    );
+    logs = {
+      error: jest.spyOn(console, 'error').mockImplementation(() => {}),
+      warn: jest.spyOn(console, 'warn').mockImplementation(() => {}),
+      log: jest.spyOn(console, 'log').mockImplementation(() => {}),
+    };
+  });
+
+  afterEach(() => {
+    Object.values(logs).forEach((spy) => spy.mockRestore());
+  });
+
+  afterAll(() => {
+    restoreModuleMocks();
+  });
+
+  const documented = (packageName, productName, autolinkWhen = null) => ({
+    packageRoot: path.join(tmp, packageName),
+    productName,
+    ...(autolinkWhen != null && { autolinkWhen }),
+  });
+
+  const run = ({ packages, metadata, precompiled = [], properties = null }) => {
+    const outDir = path.join(tmp, 'out');
+    const appIosDir = path.join(tmp, 'app', 'ios');
+    fs.mkdirSync(appIosDir, { recursive: true });
+    let podfilePropertiesPath = null;
+    if (properties != null) {
+      podfilePropertiesPath = path.join(appIosDir, 'Podfile.properties.json');
+      fs.writeFileSync(podfilePropertiesPath, JSON.stringify(properties));
+    }
+    resolveAppTarget.mockReset();
+    resolveAppTarget.mockReturnValue({
+      targetName: null,
+      entitlementPath: null,
+      podfilePropertiesPath,
+    });
+    resolveExpoModules.mockReturnValue({
+      modules: ['expo-modules-core', ...packages].map((name) => modules[name]),
+      extraDependencies: [],
+    });
+    prebuiltMetadata.mockReturnValue(metadata);
+    resolveFlavoredFramework.mockImplementation(({ frameworkName }) =>
+      frameworkName === 'ExpoModulesCore' || precompiled.includes(frameworkName)
+        ? { id: frameworkName.toLowerCase(), frameworkName }
+        : null
+    );
+    providerWrittenTo(outDir);
+    let result = null;
+    const thrown = thrownBy(() => {
+      result = runPlugin(tmp);
+    });
+    return { result, thrown, report: logs.error.mock.calls.map(([text]) => text).join('\n') };
+  };
+
+  const precompiledGated = () => ({
+    packages: ['expo-camera'],
+    metadata: {
+      ExpoCameraBarcodeScanning: documented(
+        'expo-camera',
+        'ExpoCameraBarcodeScanning',
+        barcodeGate
+      ),
+    },
+    precompiled: ['ExpoCameraBarcodeScanning'],
+  });
+
+  const sourceGated = () => ({
+    packages: ['expo-scanner'],
+    metadata: { ExpoScanner: documented('expo-scanner', 'ExpoScanner', barcodeGate) },
+  });
+
+  describe.each([
+    ['met', { 'expo.camera.barcode-scanner-enabled': 'true' }],
+    ['not met', { 'expo.camera.barcode-scanner-enabled': 'false' }],
+  ])('when the condition is %s', (_, properties) => {
+    it('refuses a gated pod resolved as a precompiled framework', () => {
+      const { result, thrown, report } = run({ ...precompiledGated(), properties });
+
+      expect(result).toBeNull();
+      expect(thrown).toBeInstanceOf(UnsupportedModulesError);
+      expect(thrown.unsupported).toEqual([
+        expect.objectContaining({
+          reason: 'unchecked-autolink-condition',
+          podName: 'ExpoCameraBarcodeScanning',
+          packageName: 'expo-camera',
+          productName: 'ExpoCameraBarcodeScanning',
+          precompiled: true,
+        }),
+      ]);
+      expect(report).toContain('"ExpoCameraBarcodeScanning"');
+      expect(report).toContain('"expo-camera"');
+      expect(report).toContain('precompiled');
+    });
+
+    it('refuses a gated pod built from source without a checked-in Package.swift', () => {
+      const { result, thrown, report } = run({ ...sourceGated(), properties });
+
+      expect(result).toBeNull();
+      expect(thrown).toBeInstanceOf(UnsupportedModulesError);
+      expect(thrown.unsupported).toEqual([
+        expect.objectContaining({
+          reason: 'unchecked-autolink-condition',
+          podName: 'ExpoScanner',
+          packageName: 'expo-scanner',
+          productName: 'ExpoScanner',
+          precompiled: false,
+        }),
+      ]);
+      expect(report).toContain('"ExpoScanner"');
+      expect(report).toContain('"expo-scanner"');
+      expect(report).toContain('without a checked-in Package.swift');
+    });
+  });
+
+  it('links an ungated precompiled pod', () => {
+    const { result, thrown } = run({
+      packages: ['expo-image'],
+      metadata: { ExpoImage: documented('expo-image', 'ExpoImage') },
+      precompiled: ['ExpoImage'],
+    });
+
+    expect(thrown).toBeNull();
+    expect(result.flavoredFrameworks.map((f) => f.frameworkName)).toContain('ExpoImage');
+  });
+
+  // Pass 2 re-emits a package's first pod when a sibling is not precompiled.
+  it('reports a precompiled gated pod once when pass 2 reaches its package again', () => {
+    const [scanner] = modules['expo-camera'].pods;
+    modules['expo-camera'].pods.push({
+      podName: 'ExpoCameraExtra',
+      podspecDir: scanner.podspecDir,
+    });
+
+    const { thrown } = run({ ...precompiledGated() });
+
+    expect(
+      thrown.unsupported.filter((entry) => entry.reason === 'unchecked-autolink-condition')
+    ).toEqual([
+      expect.objectContaining({ podName: 'ExpoCameraBarcodeScanning', precompiled: true }),
+    ]);
+  });
+
+  it('names every refused pod in one error', () => {
+    const { thrown, report } = run({
+      packages: ['expo-camera', 'expo-scanner'],
+      metadata: { ...precompiledGated().metadata, ...sourceGated().metadata },
+      precompiled: ['ExpoCameraBarcodeScanning'],
+    });
+
+    expect(thrown).toBeInstanceOf(UnsupportedModulesError);
+    expect(thrown.unsupported.map((entry) => entry.podName)).toEqual([
+      'ExpoCameraBarcodeScanning',
+      'ExpoScanner',
+    ]);
+    expect(logs.error).toHaveBeenCalledTimes(1);
+    expect(report).toContain('"ExpoCameraBarcodeScanning"');
+    expect(report).toContain('"ExpoScanner"');
   });
 });

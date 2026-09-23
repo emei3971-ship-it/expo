@@ -28,7 +28,7 @@
  * The logic is split across sibling modules — cli.js (I/O), classify.js
  * (discovery), app-target.js (the app's Xcode target), flavored-frameworks.js
  * (precompiled frameworks), react-descriptor.js + manifests.js (rendering),
- * podspec.js (podspec reading),
+ * podspec.js (podspec reading), autolink-gate.js (`autolinkWhen` gates),
  * script-phases.js (build script phases), diagnostics.js (errors and
  * warnings) — with unit tests in __tests__/. This file is just the orchestrator.
  */
@@ -38,7 +38,8 @@
 const fs = require('fs');
 const path = require('path');
 
-const { resolveAppTarget } = require('./app-target');
+const { readPodfileProperties, resolveAppTarget } = require('./app-target');
+const { autolinkConditionLabel, autolinkConditionMet } = require('./autolink-gate');
 const { resolveExpoModules, prebuiltMetadata, generateModulesProvider } = require('./cli');
 const {
   APPLE_SOURCE_DIRS,
@@ -60,6 +61,7 @@ const {
   reportUnsupported,
 } = require('./diagnostics');
 const {
+  artifactBaseDirs,
   assertDistinctFlavoredFrameworks,
   byteOrder,
   prepareCompileInterfaces,
@@ -136,6 +138,53 @@ function resolvePodIdentities(modules, metadata, autolinkedRoots) {
   return identities;
 }
 
+/**
+ * The `autolinkWhen` gates the document declares, by resolved package root and
+ * then product name; a product with no gate maps to null.
+ *
+ * The document is keyed by POD name while a checked-in manifest names PRODUCTS,
+ * so the match is on the entry's product name — restricted to the entries of one
+ * module, because two packages may ship a product of the same name. The first
+ * entry to name a product decides it.
+ */
+function indexAutolinkConditions(metadata) {
+  const byRoot = new Map();
+  for (const [podName, entry] of Object.entries(metadata)) {
+    if (typeof entry?.packageRoot !== 'string') continue;
+    const root = path.resolve(entry.packageRoot);
+    const products = byRoot.get(root) ?? new Map();
+    byRoot.set(root, products);
+    const productName = entry.productName ?? podName;
+    if (!products.has(productName)) products.set(productName, entry.autolinkWhen ?? null);
+  }
+  return byRoot;
+}
+
+/**
+ * The gate for one product of the module at `moduleRoot`, or null when it declares
+ * none. A product no entry matches stays ungated: withholding one because a path
+ * failed to line up would drop a module with no diagnostic at all.
+ */
+function productAutolinkCondition(autolinkConditions, moduleRoot, productName) {
+  return autolinkConditions.get(path.resolve(moduleRoot))?.get(productName) ?? null;
+}
+
+/**
+ * The diagnostic entry for a pod that declares an `autolinkWhen` condition but is
+ * about to be linked where no condition is checked, or null when it declares none.
+ */
+function uncheckedAutolinkCondition(metadata, packageName, pod, identity, precompiled) {
+  if (metadata[pod.podName]?.autolinkWhen == null) return null;
+  return {
+    reason: 'unchecked-autolink-condition',
+    podName: pod.podName,
+    packageName,
+    moduleRoot: identity.moduleRoot,
+    productName: identity.productName,
+    precompiled,
+  };
+}
+
 // Expo modules use Swift macros (@Field, @Record, @OptimizedFunction). A macro expands
 // only when the compiler is handed the macro plugin executable, which ships prebuilt and
 // declares no SwiftPM products — so it travels as a compiler flag, not a dependency.
@@ -180,6 +229,19 @@ module.exports = function expoSpmPlugin(context) {
   const metadata = prebuiltMetadata(appRoot);
   const autolinkedRoots = collectAutolinkedRoots(autolinking);
   const identities = resolvePodIdentities(modules, metadata, autolinkedRoots);
+  const autolinkConditions = indexAutolinkConditions(metadata);
+  // Read once, and before pass 2: the app target answers both which gated
+  // products this install links and which Xcode target the registry is generated
+  // for, and a second reading could answer the two differently.
+  const appTarget = resolveAppTarget(context.appRoot);
+  const autolinkGate = {
+    // Every pod the install DECLARES, not the ones emitted so far: membership
+    // must not depend on how far the emit loops have got, and a declared pod
+    // CocoaPods links is a satisfied condition here too.
+    declaredPodNames: new Set(Object.keys(metadata)),
+    autolinkedPackages: new Set(modules.map((m) => m.packageName)),
+    podfileProperties: readPodfileProperties(appTarget.podfilePropertiesPath),
+  };
   const outDir = path.join(outputDir, 'expo');
   // The old contract generated mutable binaryTarget packages here. They are
   // invalid under automatic configuration selection and must never survive a
@@ -198,12 +260,18 @@ module.exports = function expoSpmPlugin(context) {
   const emitted = new Set(); // pod names already contributed
   const reactWired = []; // pods that got React wired (for logging)
   const sourceManifest = []; // packages emitted from a checked-in manifest
+  const gatedOff = []; // products an unmet autolinkWhen condition withholds
+  // Only a checked-in manifest's products have their autolinkWhen checked (pass 2,
+  // branch A); a gated pod linked any other way fails the sync instead.
+  const uncheckedConditions = [];
   const pureSwiftSource = []; // packages emitted from a pure-Swift descriptor
   const unmappedDeps = []; // emitted pods depending on pods with no SwiftPM counterpart
   const xcconfigLinkage = []; // emitted pods whose podspec xcconfig sets linker flags
   const unresolvedTargets = new Map(); // module root → manifest targets with no sources on disk
   const unsupportedTargetDeps = new Map(); // module root → deps the generated package cannot declare
+  const unsupportedPackageDeps = new Map(); // module root → packages the generated package cannot declare
   const podspecLinkage = new Map(); // module root → podspec line declaring native linkage
+  const partiallyPrecompiled = new Map(); // module root → its precompiled pods + where they resolved from
 
   // Pass 1 — precompiled runtime frameworks. The declaration is all-or-nothing:
   // once one flavor exists, the resolver requires and prepares both before RN
@@ -215,7 +283,8 @@ module.exports = function expoSpmPlugin(context) {
   for (const mod of modules) {
     for (const pod of mod.pods ?? []) {
       if (emitted.has(pod.podName)) continue;
-      const { entry, moduleRoot, productName } = identities.get(pod);
+      const identity = identities.get(pod);
+      const { entry, moduleRoot, productName } = identity;
       if (pod.podName === 'ExpoModulesCore') coreModuleRoot = moduleRoot;
       const needsReact = moduleNeedsReact(pod.podName, moduleRoot);
       const framework = resolveFlavoredFramework({
@@ -236,6 +305,14 @@ module.exports = function expoSpmPlugin(context) {
         });
         emitted.add(pod.podName);
         if (needsReact) reactWired.push(pod.podName);
+        const unchecked = uncheckedAutolinkCondition(
+          metadata,
+          mod.packageName,
+          pod,
+          identity,
+          true
+        );
+        if (unchecked != null) uncheckedConditions.push(unchecked);
       }
     }
   }
@@ -280,9 +357,28 @@ module.exports = function expoSpmPlugin(context) {
       const pods = mod.pods ?? [];
       if (!pods.length || pods.every((p) => emitted.has(p.podName))) continue;
       const pod = pods[0];
-      const { entry, moduleRoot } = identities.get(pod);
+      const identity = identities.get(pod);
+      const { entry, moduleRoot } = identity;
+      const hasManifest = fs.existsSync(path.join(moduleRoot, 'Package.swift'));
+      const precompiledSiblings = pods.filter((p) => precompiledFrameworks.has(p.podName));
 
-      if (fs.existsSync(path.join(moduleRoot, 'Package.swift'))) {
+      if (precompiledSiblings.length > 0 && (hasManifest || isPureSwift(moduleRoot))) {
+        // Both source branches build the whole module, so emitting it would link
+        // the precompiled pods a second time, from source.
+        partiallyPrecompiled.set(moduleRoot, {
+          precompiledSiblings: precompiledSiblings.map((p) => p.podName),
+          precompiledProducts: precompiledSiblings.map((p) => identities.get(p).productName),
+          artifactDirs: artifactBaseDirs(mod.packageName, moduleRoot),
+        });
+        continue;
+      }
+
+      // Third-party products the emitted manifest depends on, and so are counterparts
+      // of the pods its podspec names: read from the module's checked-in manifest, or
+      // from its spm.config.json when it ships none.
+      let declaredSpmProducts = [];
+
+      if (hasManifest) {
         // Module ships a checked-in Package.swift → mirror its targets + inject deps.
         const e = emitSourceManifestPackage({
           moduleRoot,
@@ -295,11 +391,29 @@ module.exports = function expoSpmPlugin(context) {
         });
         if (e.unsupportedTargetDeps != null) {
           unsupportedTargetDeps.set(moduleRoot, e.unsupportedTargetDeps);
+        } else if (e.unsupportedPackageDeps != null) {
+          unsupportedPackageDeps.set(moduleRoot, e.unsupportedPackageDeps);
         } else if (e.unresolvedTargets != null) {
           unresolvedTargets.set(moduleRoot, e.unresolvedTargets);
         } else {
+          declaredSpmProducts = e.spmProductNames;
           packageDependencies.push(e.packageDep);
-          productDependencies.push(...e.productDeps);
+          // The emitted manifest keeps every target; a withheld product is simply
+          // never depended on, so SwiftPM never builds it.
+          for (const productDep of e.productDeps) {
+            const condition = productAutolinkCondition(
+              autolinkConditions,
+              moduleRoot,
+              productDep.name
+            );
+            if (condition != null && !autolinkConditionMet(condition, autolinkGate)) {
+              gatedOff.push(
+                `${productDep.name} (${autolinkConditionLabel(condition) ?? 'unrecognized condition'})`
+              );
+              continue;
+            }
+            productDependencies.push(productDep);
+          }
           pods.forEach((p) => emitted.add(p.podName));
           sourceManifest.push(mod.packageName);
           if (react != null) reactWired.push(pod.podName);
@@ -317,6 +431,7 @@ module.exports = function expoSpmPlugin(context) {
           ].filter(Boolean)
         );
         if (podspecs.linkage != null) podspecLinkage.set(moduleRoot, podspecs.linkage);
+        const spmPackages = entry?.spmPackages ?? [];
         const e =
           podspecs.linkage != null
             ? null
@@ -329,13 +444,29 @@ module.exports = function expoSpmPlugin(context) {
                 codegenPkgPath,
                 iosDeploymentTarget: raiseFloor(entry?.iosDeploymentTarget, coreDeploymentTarget),
                 macroFlags: macroFlags(),
+                spmPackages,
               });
         if (e != null) {
+          declaredSpmProducts = spmPackages.map((pkg) => pkg.productName);
           packageDependencies.push(e.packageDep);
           productDependencies.push(e.productDep);
-          pods.forEach((p) => emitted.add(p.podName));
+          // One target, for this pod alone. Marking the package's other pods
+          // emitted would drop each of them with no diagnostic, and the app
+          // would fail at runtime with "Cannot find native module".
+          emitted.add(pod.podName);
           pureSwiftSource.push(pod.podName);
           if (react != null) reactWired.push(pod.podName);
+          // A first pod that pass 1 precompiled was reported there already.
+          if (!precompiledFrameworks.has(pod.podName)) {
+            const unchecked = uncheckedAutolinkCondition(
+              metadata,
+              mod.packageName,
+              pod,
+              identity,
+              false
+            );
+            if (unchecked != null) uncheckedConditions.push(unchecked);
+          }
           if (podspecs.linkerFlags != null) {
             xcconfigLinkage.push({
               packageName: mod.packageName,
@@ -350,7 +481,10 @@ module.exports = function expoSpmPlugin(context) {
       // when a sibling pod of the same package is not precompiled, and warning
       // again would print the identical block twice.
       if (emitted.has(pod.podName) && !precompiledFrameworks.has(pod.podName)) {
-        const unmapped = collectUnmappedDependencies(pod.podspecDir, satisfiedDependencies);
+        const unmapped = collectUnmappedDependencies(
+          pod.podspecDir,
+          new Set([...satisfiedDependencies, ...declaredSpmProducts])
+        );
         if (unmapped.length > 0) {
           unmappedDeps.push({
             packageName: mod.packageName,
@@ -378,8 +512,12 @@ module.exports = function expoSpmPlugin(context) {
         pureSwift: isPureSwift(moduleRoot),
         hasSources: appleSourceDir(moduleRoot) != null,
         unsupportedTargetDeps: unsupportedTargetDeps.get(moduleRoot) ?? null,
+        unsupportedPackageDeps: unsupportedPackageDeps.get(moduleRoot) ?? null,
         unresolvedTargets: unresolvedTargets.get(moduleRoot) ?? null,
         podspecLinkage: podspecLinkage.get(moduleRoot) ?? null,
+        precompiledSiblings: partiallyPrecompiled.get(moduleRoot)?.precompiledSiblings ?? null,
+        precompiledProducts: partiallyPrecompiled.get(moduleRoot)?.precompiledProducts ?? null,
+        artifactDirs: partiallyPrecompiled.get(moduleRoot)?.artifactDirs ?? null,
         prebuildProduct,
       });
     }
@@ -397,6 +535,7 @@ module.exports = function expoSpmPlugin(context) {
   console.log(
     `[expo-spm-plugin] React wired into (${reactWired.length}): ${reactWired.join(', ') || '—'}`
   );
+  console.log(`[expo-spm-plugin] gated off (${gatedOff.length}): ${gatedOff.join(', ') || '—'}`);
   console.log(
     `[expo-spm-plugin] not supported (${pending.length}): ${pending.map((p) => p.podName).join(', ') || '—'}`
   );
@@ -419,7 +558,10 @@ module.exports = function expoSpmPlugin(context) {
     );
   }
 
-  const unsupported = reportUnsupported(classifyUnsupported({ pending, coreAvailable }));
+  const unsupported = reportUnsupported([
+    ...classifyUnsupported({ pending, coreAvailable }),
+    ...uncheckedConditions,
+  ]);
   if (unsupported != null) {
     throw unsupported;
   }
@@ -432,7 +574,6 @@ module.exports = function expoSpmPlugin(context) {
   // empty. In the app's main module the class always registers, matching CocoaPods
   // `use_expo_modules!` (which adds ExpoModulesProvider.swift to the app target).
   const generatedSources = [];
-  const appTarget = resolveAppTarget(context.appRoot);
   let providerPath;
   try {
     providerPath = generateModulesProvider({
