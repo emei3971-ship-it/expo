@@ -6,9 +6,16 @@
 
 ### 🎉 New features
 
+- Publish a product's `autolinkWhen` condition in the prebuilt-metadata document, so consumers other than CocoaPods can apply the same gate.
+
 ### 🐛 Bug fixes
 
 ### 💡 Others
+
+- [iOS] Mark source-only products with `sourceOnly` in the `prebuilt-metadata` document, so consumers can tell a product that never produces an XCFramework from one the prebuild pipeline can build.
+- [iOS] Publish each product's iOS deployment floor as `iosDeploymentTarget` in the `prebuilt-metadata` document, so consumers outside CocoaPods can read it from the product's own config instead of its podspec.
+- [iOS] Publish each product's SPM package dependencies as `spmDependencies` in the `prebuilt-metadata` document, so consumers can find the XCFrameworks that ship beside a precompiled product without reading its config.
+- [iOS] Publish the full SwiftPM coordinates of each product's package dependencies as `spmPackages` in the `prebuilt-metadata` document, so a consumer that declares them itself has the URL, product name and version requirement.
 
 ## 58.0.3 — 2026-09-21
 
