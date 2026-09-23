@@ -19,7 +19,15 @@ function resolveAutolinkingBin() {
   });
 }
 
-/** `expo-modules-autolinking resolve --platform apple --json` from the app root. */
+/**
+ * `expo-modules-autolinking resolve --platform apple --json` from the app root:
+ * the Expo modules to contribute, and beside them the extra CocoaPods
+ * dependencies the app declares (`extraPods`, via Podfile.properties.json),
+ * which the plugin reports but cannot install.
+ *
+ * Both are always arrays: an older CLI answers with the module array alone, and
+ * an app that declares no extra pods omits the key.
+ */
 function resolveExpoModules(appRoot) {
   const bin = resolveAutolinkingBin();
   const stdout = execFileSync(process.execPath, [bin, 'resolve', '--platform', 'apple', '--json'], {
@@ -28,7 +36,24 @@ function resolveExpoModules(appRoot) {
     maxBuffer: MAX_BUFFER,
   });
   const parsed = JSON.parse(stdout);
-  return Array.isArray(parsed) ? parsed : (parsed.modules ?? []);
+  if (Array.isArray(parsed)) return { modules: parsed, extraDependencies: [] };
+  return { modules: parsed.modules ?? [], extraDependencies: parsed.extraDependencies ?? [] };
+}
+
+/**
+ * `expo-modules-autolinking prebuilt-metadata --json` from the app root: the
+ * published pod → npm package → product identity join, keyed by pod name. It is
+ * the same document `pod install` derives its prebuilt modules from, so reading
+ * it keeps both integrations on one source of truth.
+ */
+function prebuiltMetadata(appRoot) {
+  const bin = resolveAutolinkingBin();
+  const stdout = execFileSync(process.execPath, [bin, 'prebuilt-metadata', '--json'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+    maxBuffer: MAX_BUFFER,
+  });
+  return JSON.parse(stdout);
 }
 
 /**
@@ -96,6 +121,7 @@ function runDumpPackage(moduleRoot) {
 module.exports = {
   resolveAutolinkingBin,
   resolveExpoModules,
+  prebuiltMetadata,
   generateModulesProvider,
   runDumpPackage,
 };
